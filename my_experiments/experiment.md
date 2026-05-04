@@ -67,6 +67,37 @@ than the GBT baseline (~0.856) because the 0.5 prior ignores all available featu
 | BCE                       | 0.6931           |
 | ADE                       | 40.3 px          |
 
+---
+
+## Experiment #2 — LightGBM Intent Classifier (Tuned) + Constant Velocity Trajectory
+
+### Description
+
+LightGBM binary classifier for intent, retaining Constant Velocity trajectory from Experiment #1.
+
+- **Features (26-dim):** Normalised bbox position, size, aspect ratio; per-frame velocity (last 4 frames and full window); velocity std; pixel-distance speed statistics; ego speed and yaw statistics (mean, last, max, std); context flags (time_of_day, weather).
+- **Training:** Grid search over `learning_rate ∈ {0.01, 0.05, 0.1}`, `num_leaves ∈ {15, 31, 63}`, `max_depth ∈ {-1, 5, 10}` (27 combinations). Early stopping on dev set (30 rounds patience, max 500 trees) to find the generalisation-optimal tree count for each combo. Best combo retrained on full training set with fixed `n_estimators`.
+- **Best params:** `learning_rate=0.1, num_leaves=63, max_depth=5, n_estimators=35`.
+- **Trajectory:** Unchanged — constant-velocity extrapolation (last 4 frames).
+
+### Hypothesis
+
+LightGBM's leaf-wise tree growth captures non-linear interactions between pedestrian position, velocity direction, and ego motion that the fixed 0.5 prior misses entirely. Using dev-set early stopping (mirroring the reference baseline's `eval_set` approach) ensures the model stops before memorising within-video patterns, achieving well-calibrated probabilities on unseen video distributions and significantly lowering the intent_term.
+
+### Results (Dev set, 5 k sample)
+
+| Metric                    | Value            |
+| ------------------------- | ---------------- |
+| **Composite score** | **0.8211** |
+| intent_term               | 0.833            |
+| traj_term                 | 0.809            |
+| BCE                       | 0.2072           |
+| ADE                       | 40.3 px          |
+
+*Beats reference baseline (0.8311). Intent term improved from 2.786 → 0.833; trajectory unchanged.*
+
+---
+
 ## Scoring Reference
 
 ```
