@@ -5,13 +5,11 @@ Usage (from my_experiments/):
 
 Workflow
 --------
-1. Load train.parquet and dev.parquet; extract (bbox_history, future_bboxes).
-2. Normalise all coordinates by frame_w=1920, frame_h=1080.
+1. Load train.parquet and dev.parquet.
+2. Build input X (N, 16, 6): normalised bbox history + ego_speed + ego_yaw.
+   ego features are zero when ego_available=False — the model learns this.
 3. Compute anchor = last observed bbox (normalised).  Compute target delta:
        y_delta = future_bbox_norm - anchor  (displacement from last obs)
-   This residual formulation is key: the GRU learns displacement, not
-   absolute position.  If the model outputs zero it recovers a stationary
-   prediction; velocity-based extrapolation is well within its capacity.
 4. Grid search over 8 combinations:
        hidden_size ∈ {32, 64}
        num_layers  ∈ {1, 2}
@@ -23,7 +21,7 @@ Workflow
 
 At inference (predict.py):
     anchor_norm = last_bbox / [W, H, W, H]
-    pred_delta_norm = model(history_norm)      # (4, 4)
+    pred_delta_norm = model(history_norm_6feat)   # (4, 4)
     pred_abs_px = (anchor_norm + pred_delta_norm) * [W, H, W, H]
 """
 
@@ -52,6 +50,10 @@ DATA = _HERE.parent.parent / "crossing-challenge-starter" / "data"
 FRAME_W = 1920.0
 FRAME_H = 1080.0
 HORIZONS = ["bbox_500ms", "bbox_1000ms", "bbox_1500ms", "bbox_2000ms"]
+
+# Ego-motion normalisation constants (fixed; zeros stay zero for ego_available=False)
+EGO_SPEED_NORM = 30.0    # m/s  — typical urban speed ceiling
+EGO_YAW_NORM   = 1.0     # rad/s — typical max yaw rate for a turning vehicle
 
 # ── Training hyper-parameters ─────────────────────────────────────────────────
 BATCH_SIZE = 256
@@ -92,21 +94,36 @@ def _stack_flat(series: pd.Series) -> np.ndarray:
     return np.stack([np.asarray(v, dtype=np.float32) for v in series])
 
 
-def load_split(split: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (X, anchor, y_delta) float32 arrays, all normalised to [0, 1].
+def _stack_1d(series: pd.Series) -> np.ndarray:
+    """Convert a Series of flat 16-element lists to (N, 16) float32.
 
-    X       : (N, 16, 4)  — bbox_history (normalised)
+    Used for ego_speed_history / ego_yaw_history.
+    """
+    return np.stack([np.asarray(v, dtype=np.float32) for v in series])
+
+
+def load_split(split: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (X, anchor, y_delta) float32 arrays.
+
+    X       : (N, 16, 6)  — [bbox_norm(4), ego_speed_norm, ego_yaw_norm]
     anchor  : (N,  1, 4)  — last observed bbox normalised (broadcast-ready)
     y_delta : (N,  4, 4)  — future_bbox_norm - anchor  (displacement target)
     """
     print(f"  Loading {split}.parquet ...", flush=True)
     df = pd.read_parquet(DATA / f"{split}.parquet")
 
-    X = _stack_col(df["bbox_history"])          # (N, 16, 4) px
-    X[:, :, [0, 2]] /= FRAME_W
-    X[:, :, [1, 3]] /= FRAME_H
+    X_bbox = _stack_col(df["bbox_history"])          # (N, 16, 4) px
+    X_bbox[:, :, [0, 2]] /= FRAME_W
+    X_bbox[:, :, [1, 3]] /= FRAME_H
 
-    anchor = X[:, -1:, :].copy()               # (N, 1, 4) last obs normalised
+    anchor = X_bbox[:, -1:, :].copy()               # (N, 1, 4) last obs normalised
+
+    # Ego-motion features — zeros when ego_available=False (model learns this signal)
+    speed = _stack_1d(df["ego_speed_history"]) / EGO_SPEED_NORM  # (N, 16)
+    yaw   = _stack_1d(df["ego_yaw_history"])   / EGO_YAW_NORM    # (N, 16)
+    X = np.concatenate(
+        [X_bbox, speed[:, :, None], yaw[:, :, None]], axis=2
+    )  # (N, 16, 6)
 
     y_abs = np.stack([_stack_flat(df[col]) for col in HORIZONS], axis=1)  # (N, 4, 4) px
     y_abs[:, :, [0, 2]] /= FRAME_W

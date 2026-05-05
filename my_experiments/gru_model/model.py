@@ -2,14 +2,14 @@
 
 Architecture
 ------------
-Input  : (batch, 16, 4) — normalised [x1, y1, x2, y2] history at 15 Hz.
+Input  : (batch, 16, 6) — normalised [x1, y1, x2, y2, ego_speed, ego_yaw]
+         history at 15 Hz.  ego_speed is normalised by EGO_SPEED_NORM (30 m/s)
+         and ego_yaw by EGO_YAW_NORM (1.0 rad/s).  Both are zero when
+         ego_available=False; the model learns this correlation.
 GRU    : hidden_size=[32|64], num_layers=[1|2], dropout applied after GRU.
 Head   : Linear(hidden_size → 16) reshaped to (batch, 4, 4).
-Output : (batch, 4, 4) — normalised [x1, y1, x2, y2] at horizons
-         [+8, +15, +23, +30] frames (+0.5 s, +1.0 s, +1.5 s, +2.0 s).
-
-Coordinates are normalised by frame_w (1920) and frame_h (1080) before
-being fed in, and must be denormalised back to pixels after inference.
+Output : (batch, 4, 4) — normalised displacement delta from last observed
+         bbox at horizons [+8, +15, +23, +30] frames.
 """
 
 from __future__ import annotations
@@ -33,13 +33,14 @@ class GRUTrajectory(nn.Module):
         hidden_size: int = 64,
         num_layers: int = 1,
         dropout: float = 0.1,
+        input_size: int = 6,
     ) -> None:
         super().__init__()
         # PyTorch GRU only applies inter-layer dropout; need manual dropout
         # on the final hidden state regardless of num_layers.
         gru_dropout = dropout if num_layers > 1 else 0.0
         self.gru = nn.GRU(
-            input_size=4,
+            input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             dropout=gru_dropout,
@@ -52,9 +53,9 @@ class GRUTrajectory(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, 16, 4) normalised bbox history.
+            x: (B, 16, 6) normalised [bbox, ego_speed, ego_yaw] history.
         Returns:
-            (B, 4, 4) normalised predicted bboxes at 4 future horizons.
+            (B, 4, 4) normalised delta from anchor at 4 future horizons.
         """
         _, h = self.gru(x)                        # h: (num_layers, B, H)
         feat = self.post_dropout(h[-1])            # (B, H)

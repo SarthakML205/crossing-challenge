@@ -37,6 +37,10 @@ GRU_CFG_PATH = _BASE / "gru_model" / "model_config.json"
 FRAME_W = 1920.0
 FRAME_H = 1080.0
 
+# Must match train_gru.py constants exactly
+EGO_SPEED_NORM = 30.0
+EGO_YAW_NORM   = 1.0
+
 HORIZONS_FRAMES = [8, 15, 23, 30]
 HORIZON_KEYS    = ["bbox_500ms", "bbox_1000ms", "bbox_1500ms", "bbox_2000ms"]
 VELOCITY_WINDOW = 4   # frames used by CV fallback
@@ -115,12 +119,24 @@ def predict(request: dict) -> dict:
 
     gru = _load_gru()
     if gru is not None:
-        # Normalise history and compute anchor (last observed bbox, normalised).
+        # Normalise bbox history.
         x_norm = hist.astype(np.float32).copy()
         x_norm[:, [0, 2]] /= FRAME_W
         x_norm[:, [1, 3]] /= FRAME_H
         anchor_norm = x_norm[-1]                               # (4,)
-        inp = torch.from_numpy(x_norm).unsqueeze(0)            # (1, 16, 4)
+
+        # Append ego-motion features (zeros when ego_available=False).
+        speed = np.array(
+            request.get("ego_speed_history", [0.0] * 16), dtype=np.float32
+        ) / EGO_SPEED_NORM                                     # (16,)
+        yaw = np.array(
+            request.get("ego_yaw_history", [0.0] * 16), dtype=np.float32
+        ) / EGO_YAW_NORM                                       # (16,)
+        x6 = np.concatenate(
+            [x_norm, speed[:, None], yaw[:, None]], axis=1
+        )                                                      # (16, 6)
+
+        inp = torch.from_numpy(x6).unsqueeze(0)                # (1, 16, 6)
         with torch.no_grad():
             pred_delta_norm = gru(inp).squeeze(0).numpy()      # (4, 4) delta
         # Recover absolute pixels: (anchor + delta) × frame_dims

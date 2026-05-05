@@ -127,6 +127,35 @@ A GRU with dev-set early-stopped training will learn non-linear pedestrian motio
 
 ---
 
+## Experiment #4 — GRU with Ego-Motion Fusion + Docker Size Optimization
+
+### Description
+
+- **Intent:** LightGBM (unchanged from Experiment #2).
+- **Trajectory:** GRU with 6-feature input per frame: `[x1_norm, y1_norm, x2_norm, y2_norm, ego_speed_norm, ego_yaw_norm]`. `ego_speed` normalised by 30 m/s; `ego_yaw` normalised by 1.0 rad/s. Both are exactly zero when `ego_available=False` — the model learns this correlation from data rather than requiring a masking mechanism.
+  - Architecture identical to Experiment #3 (`GRU(input_size=6, hidden_size=H, num_layers=L)` → Dropout → `Linear(H, 16)` → reshape `(4, 4)`). Same residual delta formulation.
+  - Grid search over `hidden_size ∈ {32, 64}`, `num_layers ∈ {1, 2}`, `dropout ∈ {0.1, 0.2}` (8 combos), dev-set early stopping (patience=12, improve_thresh=0.20 px, max 80 epochs).
+  - Best combo: `hidden_size=64, num_layers=2, dropout=0.2` (dev ADE 32.98 px, stopped at epoch 80).
+- **Docker optimization:** Base image changed from `python:3.11-slim` to `python:3.9-slim`; all system deps + pip installs consolidated into a single `RUN` layer; PyTorch CPU wheel installed from `download.pytorch.org/whl/cpu` before requirements.txt to avoid pulling CUDA-bundled packages from PyPI.
+
+### Hypothesis
+
+Fusing ego-vehicle speed and yaw rate into each input frame allows the GRU to decompose apparent pedestrian motion into two components: intrinsic walking velocity and optical flow induced by camera movement. Rows where `ego_available=False` have zero-filled ego features, which the model learns to interpret as a static camera. This disentanglement should lower ADE especially on samples with high lateral ego velocity, where CV extrapolation conflates camera-induced displacement with genuine pedestrian movement.
+
+### Results (Dev set, 5 k sample)
+
+| Metric                    | Value            |
+| ------------------------- | ---------------- |
+| **Composite score** | **0.7515** |
+| intent_term               | 0.833            |
+| traj_term                 | 0.670            |
+| BCE                       | 0.2072           |
+| ADE                       | 33.4 px          |
+
+*Trajectory term improved from 0.715 → 0.670 (ADE 35.6 → 33.4 px) vs Experiment #3; intent unchanged.*
+
+---
+
 ## Scoring Reference
 
 ```
