@@ -156,6 +156,35 @@ Fusing ego-vehicle speed and yaw rate into each input frame allows the GRU to de
 
 ---
 
+## Experiment #5 — Unified Multi-Task GRU (MTL)
+
+### Description
+
+- **Architecture:** Single `MTLGRUModel` with a shared GRU backbone processing the 6-feature sequence `[x1_norm, y1_norm, x2_norm, y2_norm, ego_speed_norm, ego_yaw_norm]`. Two task heads branch off the final hidden state:
+  - **Intent head:** `Linear(H, 1)` — raw logit, `BCEWithLogitsLoss` during training, `sigmoid` at inference.
+  - **Trajectory head:** `Linear(H, 16)` → reshape `(4, 4)` — normalised delta from anchor, `SmoothL1Loss`.
+- **Loss:** `total = ALPHA × BCE + BETA × SmoothL1`. Initial run with `ALPHA=1.0, BETA=20` caused BCE gradient to dominate (~9× larger magnitude), collapsing trajectory ADE to 47.9 px. Rebalanced to `ALPHA=0.05, BETA=20` so trajectory governs ~90% of backbone gradient.
+- **Grid search:** Same 8 combos as prior experiments. Best combo after rebalancing: `hidden_size=32, num_layers=2, dropout=0.2` (dev ADE 35.01 px, stopped at epoch 80).
+- **Saved as:** `mtl_models/mtl_model.pth` + `mtl_models/model_config.json`. `predict.py` uses MTL as the priority path (single forward pass for both outputs); falls back to LightGBM+GRU if absent.
+
+### Hypothesis
+
+A unified GRU backbone will learn shared motion representations that simultaneously improve trajectory prediction and provide useful features for the crossing-intent head, replacing the need for a separate LightGBM classifier and reducing inference complexity to a single forward pass.
+
+### Results (Dev set, 5 k sample)
+
+| Metric                    | Value            |
+| ------------------------- | ---------------- |
+| **Composite score** | **0.8532** |
+| intent_term               | 0.996            |
+| traj_term                 | 0.711            |
+| BCE                       | 0.2477           |
+| ADE                       | 35.4 px          |
+
+*Trajectory term (0.711) comparable to Experiment #3, but intent term regressed from 0.833 → 0.996. The GRU backbone does not generalise as well as dedicated LightGBM features on the sparse 7.9% crossing signal; hand-crafted speed, velocity-std, and ego statistics remain stronger intent predictors than learned motion embeddings at this training set size.*
+
+---
+
 ## Scoring Reference
 
 ```

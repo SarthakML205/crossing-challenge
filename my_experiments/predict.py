@@ -1,12 +1,14 @@
-﻿"""Experiment #3 — LightGBM Intent Classifier + GRU Trajectory Predictor.
+﻿"""Experiment #5 — Unified Multi-Task GRU (MTL).
 
 Contract (do NOT change the signature):
 
     predict(request: dict) -> dict
 
-Intent:     LightGBM binary classifier (model.pkl) -- unchanged from Exp #2.
-Trajectory: GRU sequence model (gru_model/trajectory_model.pth).
-            Falls back to constant-velocity if weights are absent.
+Priority chain:
+  1. MTL model (mtl_models/mtl_model.pth) — single forward pass for both
+     intent probability and trajectory delta.
+  2. LightGBM intent + GRU trajectory (gru_model/trajectory_model.pth).
+  3. LightGBM intent + constant-velocity fallback (if GRU weights absent).
 
 At 15 Hz the four prediction horizons are:
     +0.5 s  ->  +8 frames
@@ -28,11 +30,20 @@ import torch
 from features import engineer_features, _as_2d, FEATURE_NAMES
 from gru_model.model import GRUTrajectory
 
+# MTL import is optional: only available after mtl_models/ is created.
+try:
+    from mtl_models.model import MTLGRUModel as _MTLGRUModel
+    _MTL_IMPORTABLE = True
+except ImportError:
+    _MTL_IMPORTABLE = False
+
 # -- Paths ------------------------------------------------------------------
 _BASE        = Path(__file__).parent
 LGBM_PATH    = _BASE / "model.pkl"
 GRU_PTH_PATH = _BASE / "gru_model" / "trajectory_model.pth"
 GRU_CFG_PATH = _BASE / "gru_model" / "model_config.json"
+MTL_PTH_PATH = _BASE / "mtl_models" / "mtl_model.pth"
+MTL_CFG_PATH = _BASE / "mtl_models" / "model_config.json"
 
 FRAME_W = 1920.0
 FRAME_H = 1080.0
@@ -49,6 +60,8 @@ VELOCITY_WINDOW = 4   # frames used by CV fallback
 _intent_clf  = None
 _gru_model   = None
 _gru_missing = False   # set True once we confirm weights are absent
+_mtl_model   = None
+_mtl_missing = False
 
 
 def _load_intent():
@@ -80,6 +93,27 @@ def _load_gru():
     return _gru_model
 
 
+def _load_mtl():
+    """Load MTL model weights on first call; cache result. Returns None if absent."""
+    global _mtl_model, _mtl_missing
+    if _mtl_model is not None:
+        return _mtl_model
+    if _mtl_missing or not _MTL_IMPORTABLE:
+        return None
+    if not MTL_PTH_PATH.exists() or not MTL_CFG_PATH.exists():
+        _mtl_missing = True
+        return None
+    with open(MTL_CFG_PATH) as f:
+        cfg = json.load(f)
+    model = _MTLGRUModel(**cfg)
+    model.load_state_dict(
+        torch.load(MTL_PTH_PATH, map_location="cpu", weights_only=True)
+    )
+    model.eval()
+    _mtl_model = model
+    return _mtl_model
+
+
 # -- Constant-velocity fallback ---------------------------------------------
 
 def _cv_trajectory(hist: np.ndarray) -> list:
@@ -103,51 +137,57 @@ def _cv_trajectory(hist: np.ndarray) -> list:
 # -- Public API -------------------------------------------------------------
 
 def predict(request: dict) -> dict:
-    """LightGBM intent + GRU trajectory (CV fallback if model absent)."""
+    """MTL single-pass (priority), else LightGBM + GRU/CV fallback."""
 
-    # -- Intent --
-    raw = engineer_features(request)
-    if not np.isfinite(raw).all():
-        raw = np.nan_to_num(raw, nan=0.0, posinf=1.0, neginf=-1.0)
-    feats = pd.DataFrame([raw], columns=FEATURE_NAMES)
-    intent_prob = float(_load_intent().predict_proba(feats)[0, 1])
-    if not np.isfinite(intent_prob):
-        intent_prob = 0.5
-
-    # -- Trajectory --
     hist = _as_2d(request["bbox_history"])   # (16, 4) px
 
-    gru = _load_gru()
-    if gru is not None:
-        # Normalise bbox history.
-        x_norm = hist.astype(np.float32).copy()
-        x_norm[:, [0, 2]] /= FRAME_W
-        x_norm[:, [1, 3]] /= FRAME_H
-        anchor_norm = x_norm[-1]                               # (4,)
+    # Normalise bbox + build ego features (shared by MTL and GRU paths)
+    x_norm = hist.astype(np.float32).copy()
+    x_norm[:, [0, 2]] /= FRAME_W
+    x_norm[:, [1, 3]] /= FRAME_H
+    anchor_norm = x_norm[-1]                                  # (4,)
+    scale = np.array([FRAME_W, FRAME_H, FRAME_W, FRAME_H], dtype=np.float32)
 
-        # Append ego-motion features (zeros when ego_available=False).
-        speed = np.array(
-            request.get("ego_speed_history", [0.0] * 16), dtype=np.float32
-        ) / EGO_SPEED_NORM                                     # (16,)
-        yaw = np.array(
-            request.get("ego_yaw_history", [0.0] * 16), dtype=np.float32
-        ) / EGO_YAW_NORM                                       # (16,)
-        x6 = np.concatenate(
-            [x_norm, speed[:, None], yaw[:, None]], axis=1
-        )                                                      # (16, 6)
+    speed = np.array(
+        request.get("ego_speed_history", [0.0] * 16), dtype=np.float32
+    ) / EGO_SPEED_NORM
+    yaw = np.array(
+        request.get("ego_yaw_history", [0.0] * 16), dtype=np.float32
+    ) / EGO_YAW_NORM
+    x6 = np.concatenate([x_norm, speed[:, None], yaw[:, None]], axis=1)  # (16, 6)
+    inp = torch.from_numpy(x6).unsqueeze(0)                  # (1, 16, 6)
 
-        inp = torch.from_numpy(x6).unsqueeze(0)                # (1, 16, 6)
+    # -- Path 1: MTL unified model (intent + trajectory in one pass) --
+    mtl = _load_mtl()
+    if mtl is not None:
         with torch.no_grad():
-            pred_delta_norm = gru(inp).squeeze(0).numpy()      # (4, 4) delta
-        # Recover absolute pixels: (anchor + delta) × frame_dims
-        scale = np.array([FRAME_W, FRAME_H, FRAME_W, FRAME_H], dtype=np.float32)
-        pred_abs = (anchor_norm + pred_delta_norm) * scale     # (4, 4) px
+            intent_logit, delta_t = mtl(inp)
+        intent_prob = float(torch.sigmoid(intent_logit).squeeze(0).item())
+        pred_delta_norm = delta_t.squeeze(0).numpy()          # (4, 4)
+        pred_abs = (anchor_norm + pred_delta_norm) * scale    # (4, 4) px
         traj = pred_abs.tolist()
+
     else:
-        traj = _cv_trajectory(hist)
+        # -- Path 2: LightGBM intent + GRU trajectory --
+        raw = engineer_features(request)
+        if not np.isfinite(raw).all():
+            raw = np.nan_to_num(raw, nan=0.0, posinf=1.0, neginf=-1.0)
+        feats = pd.DataFrame([raw], columns=FEATURE_NAMES)
+        intent_prob = float(_load_intent().predict_proba(feats)[0, 1])
+        if not np.isfinite(intent_prob):
+            intent_prob = 0.5
+
+        gru = _load_gru()
+        if gru is not None:
+            with torch.no_grad():
+                pred_delta_norm = gru(inp).squeeze(0).numpy()  # (4, 4)
+            pred_abs = (anchor_norm + pred_delta_norm) * scale
+            traj = pred_abs.tolist()
+        else:
+            traj = _cv_trajectory(hist)
 
     # -- Assemble output --
-    out: dict = {"intent": intent_prob}
+    out: dict = {"intent": intent_prob if np.isfinite(intent_prob) else 0.5}
     for key, bbox in zip(HORIZON_KEYS, traj):
         out[key] = [float(v) if np.isfinite(v) else 0.0 for v in bbox]
 

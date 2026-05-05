@@ -1,13 +1,14 @@
-# Dockerfile — my_experiments Commit 4: LightGBM Intent + Ego-Fusion GRU Trajectory
+# Dockerfile — my_experiments Commit 5: Unified MTL GRU (intent + trajectory)
 #
-# Requires model.pkl (train_lgbm.py) and gru_model/ (train_gru.py) before building.
+# Priority: MTL model (mtl_models/mtl_model.pth) → LightGBM+GRU fallback.
+# Requires model.pkl, gru_model/, and mtl_models/ before building.
 #
 # Build:
-#   docker build -t crossing-ego-gru .
+#   docker build -t crossing-mtl .
 #
 # Test grader pathway (mount the data folder):
 #   docker run --rm -v $(pwd)/../crossing-challenge-starter/data:/work \
-#       crossing-ego-gru /work/dev.parquet /work/preds.csv
+#       crossing-mtl /work/dev.parquet /work/preds.csv
 #
 # Constraints:
 #   Total image <= 2 GB  |  4 CPUs  |  4 GB RAM  |  --network=none
@@ -31,6 +32,7 @@ RUN apt-get update \
 COPY predict.py grade.py features.py ./
 COPY model.pkl ./
 COPY gru_model/ ./gru_model/
+COPY mtl_models/ ./mtl_models/
 
 # Grader invokes:  python grade.py <input.parquet> <output.csv>
 ENTRYPOINT ["python", "grade.py"]
