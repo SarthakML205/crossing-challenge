@@ -1,69 +1,138 @@
-"""Experiment #1 — Constant Velocity Baseline (Commit 1).
+﻿"""Experiment #3 — LightGBM Intent Classifier + GRU Trajectory Predictor.
 
 Contract (do NOT change the signature):
 
     predict(request: dict) -> dict
 
-Intent:   Class-prior of 0.5 (establishes BCE floor baseline).
-Trajectory: Constant-velocity model using the last 4 observed frames to
-             estimate mean per-frame velocity, then linearly extrapolate to
-             +500 ms, +1000 ms, +1500 ms, and +2000 ms.
+Intent:     LightGBM binary classifier (model.pkl) -- unchanged from Exp #2.
+Trajectory: GRU sequence model (gru_model/trajectory_model.pth).
+            Falls back to constant-velocity if weights are absent.
 
-At 15 Hz the frame deltas for the four horizons are:
-    +0.5 s  →  +8 frames
-    +1.0 s  → +15 frames
-    +1.5 s  → +23 frames
-    +2.0 s  → +30 frames
+At 15 Hz the four prediction horizons are:
+    +0.5 s  ->  +8 frames
+    +1.0 s  -> +15 frames
+    +1.5 s  -> +23 frames
+    +2.0 s  -> +30 frames
 """
 
 from __future__ import annotations
 
+import json
+import pickle
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
+import torch
 
-# At 15 Hz: 0.5 s = 7.5 → 8 frames; see README / grade.py for derivation.
+from features import engineer_features, _as_2d, FEATURE_NAMES
+from gru_model.model import GRUTrajectory
+
+# -- Paths ------------------------------------------------------------------
+_BASE        = Path(__file__).parent
+LGBM_PATH    = _BASE / "model.pkl"
+GRU_PTH_PATH = _BASE / "gru_model" / "trajectory_model.pth"
+GRU_CFG_PATH = _BASE / "gru_model" / "model_config.json"
+
+FRAME_W = 1920.0
+FRAME_H = 1080.0
+
 HORIZONS_FRAMES = [8, 15, 23, 30]
-HORIZON_KEYS = ["bbox_500ms", "bbox_1000ms", "bbox_1500ms", "bbox_2000ms"]
+HORIZON_KEYS    = ["bbox_500ms", "bbox_1000ms", "bbox_1500ms", "bbox_2000ms"]
+VELOCITY_WINDOW = 4   # frames used by CV fallback
 
-# Number of *frames* whose velocities we average.
-# Last 4 frames → indices [-4:] → 3 inter-frame intervals.
-VELOCITY_WINDOW = 4
-
-
-def _as_2d(x) -> np.ndarray:
-    """Coerce list-of-lists / object-array to (N, 4) float64."""
-    return np.stack([np.asarray(r, dtype=np.float64) for r in x])
+# -- Lazy model cache -------------------------------------------------------
+_intent_clf  = None
+_gru_model   = None
+_gru_missing = False   # set True once we confirm weights are absent
 
 
-def predict(request: dict) -> dict:
-    """Constant-velocity trajectory + fixed 0.5 intent prior."""
-    hist = _as_2d(request["bbox_history"])  # (16, 4)
+def _load_intent():
+    global _intent_clf
+    if _intent_clf is None:
+        with open(LGBM_PATH, "rb") as fh:
+            _intent_clf = pickle.load(fh)["intent"]
+    return _intent_clf
 
-    # Centre-point history
+
+def _load_gru():
+    """Load GRU weights on first call; cache result. Returns None if absent."""
+    global _gru_model, _gru_missing
+    if _gru_model is not None:
+        return _gru_model
+    if _gru_missing:
+        return None
+    if not GRU_PTH_PATH.exists() or not GRU_CFG_PATH.exists():
+        _gru_missing = True
+        return None
+    with open(GRU_CFG_PATH) as f:
+        cfg = json.load(f)
+    model = GRUTrajectory(**cfg)
+    model.load_state_dict(
+        torch.load(GRU_PTH_PATH, map_location="cpu", weights_only=True)
+    )
+    model.eval()
+    _gru_model = model
+    return _gru_model
+
+
+# -- Constant-velocity fallback ---------------------------------------------
+
+def _cv_trajectory(hist: np.ndarray) -> list:
+    """Return 4 future bboxes via constant-velocity extrapolation."""
     cx = (hist[:, 0] + hist[:, 2]) * 0.5
     cy = (hist[:, 1] + hist[:, 3]) * 0.5
-
-    # Width/height of the most recent bbox (held constant across all horizons)
     w_last = float(hist[-1, 2] - hist[-1, 0])
     h_last = float(hist[-1, 3] - hist[-1, 1])
-
-    # Average per-frame velocity over the last VELOCITY_WINDOW frames
-    # (3 inter-frame intervals from 4 frames)
     vx = float(np.diff(cx[-VELOCITY_WINDOW:]).mean())
     vy = float(np.diff(cy[-VELOCITY_WINDOW:]).mean())
-
-    cur_cx = float(cx[-1])
-    cur_cy = float(cy[-1])
-
-    out: dict = {}
-    for h, key in zip(HORIZONS_FRAMES, HORIZON_KEYS):
+    cur_cx, cur_cy = float(cx[-1]), float(cy[-1])
+    out = []
+    for h in HORIZONS_FRAMES:
         nx = cur_cx + vx * h
         ny = cur_cy + vy * h
-        bbox = [nx - w_last / 2, ny - h_last / 2, nx + w_last / 2, ny + h_last / 2]
-        # Guard against any non-finite values from degenerate input
-        out[key] = [float(v) if np.isfinite(v) else float(cur_cx if i % 2 == 0 else cur_cy)
-                    for i, v in enumerate(bbox)]
+        out.append([nx - w_last / 2, ny - h_last / 2,
+                    nx + w_last / 2, ny + h_last / 2])
+    return out
 
-    # Intent: simple class-prior baseline — no model, no features.
-    out["intent"] = 0.5
+
+# -- Public API -------------------------------------------------------------
+
+def predict(request: dict) -> dict:
+    """LightGBM intent + GRU trajectory (CV fallback if model absent)."""
+
+    # -- Intent --
+    raw = engineer_features(request)
+    if not np.isfinite(raw).all():
+        raw = np.nan_to_num(raw, nan=0.0, posinf=1.0, neginf=-1.0)
+    feats = pd.DataFrame([raw], columns=FEATURE_NAMES)
+    intent_prob = float(_load_intent().predict_proba(feats)[0, 1])
+    if not np.isfinite(intent_prob):
+        intent_prob = 0.5
+
+    # -- Trajectory --
+    hist = _as_2d(request["bbox_history"])   # (16, 4) px
+
+    gru = _load_gru()
+    if gru is not None:
+        # Normalise history and compute anchor (last observed bbox, normalised).
+        x_norm = hist.astype(np.float32).copy()
+        x_norm[:, [0, 2]] /= FRAME_W
+        x_norm[:, [1, 3]] /= FRAME_H
+        anchor_norm = x_norm[-1]                               # (4,)
+        inp = torch.from_numpy(x_norm).unsqueeze(0)            # (1, 16, 4)
+        with torch.no_grad():
+            pred_delta_norm = gru(inp).squeeze(0).numpy()      # (4, 4) delta
+        # Recover absolute pixels: (anchor + delta) × frame_dims
+        scale = np.array([FRAME_W, FRAME_H, FRAME_W, FRAME_H], dtype=np.float32)
+        pred_abs = (anchor_norm + pred_delta_norm) * scale     # (4, 4) px
+        traj = pred_abs.tolist()
+    else:
+        traj = _cv_trajectory(hist)
+
+    # -- Assemble output --
+    out: dict = {"intent": intent_prob}
+    for key, bbox in zip(HORIZON_KEYS, traj):
+        out[key] = [float(v) if np.isfinite(v) else 0.0 for v in bbox]
 
     return out

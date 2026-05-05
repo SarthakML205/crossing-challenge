@@ -67,6 +67,66 @@ than the GBT baseline (~0.856) because the 0.5 prior ignores all available featu
 | BCE                       | 0.6931           |
 | ADE                       | 40.3 px          |
 
+---
+
+## Experiment #2 — LightGBM Intent Classifier (Tuned) + Constant Velocity Trajectory
+
+### Description
+
+LightGBM binary classifier for intent, retaining Constant Velocity trajectory from Experiment #1.
+
+- **Features (26-dim):** Normalised bbox position, size, aspect ratio; per-frame velocity (last 4 frames and full window); velocity std; pixel-distance speed statistics; ego speed and yaw statistics (mean, last, max, std); context flags (time_of_day, weather).
+- **Training:** Grid search over `learning_rate ∈ {0.01, 0.05, 0.1}`, `num_leaves ∈ {15, 31, 63}`, `max_depth ∈ {-1, 5, 10}` (27 combinations). Early stopping on dev set (30 rounds patience, max 500 trees) to find the generalisation-optimal tree count for each combo. Best combo retrained on full training set with fixed `n_estimators`.
+- **Best params:** `learning_rate=0.1, num_leaves=63, max_depth=5, n_estimators=35`.
+- **Trajectory:** Unchanged — constant-velocity extrapolation (last 4 frames).
+
+### Hypothesis
+
+LightGBM's leaf-wise tree growth captures non-linear interactions between pedestrian position, velocity direction, and ego motion that the fixed 0.5 prior misses entirely. Using dev-set early stopping (mirroring the reference baseline's `eval_set` approach) ensures the model stops before memorising within-video patterns, achieving well-calibrated probabilities on unseen video distributions and significantly lowering the intent_term.
+
+### Results (Dev set, 5 k sample)
+
+| Metric                    | Value            |
+| ------------------------- | ---------------- |
+| **Composite score** | **0.8211** |
+| intent_term               | 0.833            |
+| traj_term                 | 0.809            |
+| BCE                       | 0.2072           |
+| ADE                       | 40.3 px          |
+
+*Beats reference baseline (0.8311). Intent term improved from 2.786 → 0.833; trajectory unchanged.*
+
+---
+
+## Experiment #3 — LightGBM Intent Classifier + GRU Trajectory Predictor
+
+### Description
+
+- **Intent:** LightGBM (unchanged from Experiment #2).
+- **Trajectory:** GRU sequence model (`gru_model/GRUTrajectory`). Input: normalised 16-frame bbox history (÷ frame dims). Output: normalised displacement delta from last observed bbox at 4 horizons. Final bbox = (anchor + predicted_delta) × frame_dims.
+  - Architecture: `GRU(input_size=4, hidden_size=H, num_layers=L)` → Dropout → `Linear(H, 16)` → reshape `(4, 4)`.
+  - Grid search over `hidden_size ∈ {32, 64}`, `num_layers ∈ {1, 2}`, `dropout ∈ {0.1, 0.2}` (8 combos), dev-set early stopping (patience=12, improve_thresh=0.20 px, max 80 epochs).
+  - Best combo: `hidden_size=64, num_layers=2, dropout=0.2` (dev ADE 35.03 px, stopped at epoch 61).
+  - Residual formulation (predicting displacement rather than absolute position) was essential — absolute regression was dominated by scene-position variance and could not beat CV.
+
+### Hypothesis
+
+A GRU with dev-set early-stopped training will learn non-linear pedestrian motion patterns — acceleration, deceleration, turns — better than constant-velocity extrapolation. The residual formulation (predict displacement from last observed frame) gives the model a zero-mean, scene-agnostic learning target, allowing it to generalise to unseen intersection layouts. This should lower the traj_term below the reference baseline's 0.806 (ADE 40.2 px).
+
+### Results (Dev set, 5 k sample)
+
+| Metric                    | Value            |
+| ------------------------- | ---------------- |
+| **Composite score** | **0.7738** |
+| intent_term               | 0.833            |
+| traj_term                 | 0.715            |
+| BCE                       | 0.2072           |
+| ADE                       | 35.6 px          |
+
+*Beats reference baseline (0.8311) and Experiment #2 (0.8211). Trajectory term improved from 0.809 → 0.715; intent unchanged.*
+
+---
+
 ## Scoring Reference
 
 ```
