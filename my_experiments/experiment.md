@@ -98,6 +98,35 @@ LightGBM's leaf-wise tree growth captures non-linear interactions between pedest
 
 ---
 
+## Experiment #3 — LightGBM Intent Classifier + GRU Trajectory Predictor
+
+### Description
+
+- **Intent:** LightGBM (unchanged from Experiment #2).
+- **Trajectory:** GRU sequence model (`gru_model/GRUTrajectory`). Input: normalised 16-frame bbox history (÷ frame dims). Output: normalised displacement delta from last observed bbox at 4 horizons. Final bbox = (anchor + predicted_delta) × frame_dims.
+  - Architecture: `GRU(input_size=4, hidden_size=H, num_layers=L)` → Dropout → `Linear(H, 16)` → reshape `(4, 4)`.
+  - Grid search over `hidden_size ∈ {32, 64}`, `num_layers ∈ {1, 2}`, `dropout ∈ {0.1, 0.2}` (8 combos), dev-set early stopping (patience=12, improve_thresh=0.20 px, max 80 epochs).
+  - Best combo: `hidden_size=64, num_layers=2, dropout=0.2` (dev ADE 35.03 px, stopped at epoch 61).
+  - Residual formulation (predicting displacement rather than absolute position) was essential — absolute regression was dominated by scene-position variance and could not beat CV.
+
+### Hypothesis
+
+A GRU with dev-set early-stopped training will learn non-linear pedestrian motion patterns — acceleration, deceleration, turns — better than constant-velocity extrapolation. The residual formulation (predict displacement from last observed frame) gives the model a zero-mean, scene-agnostic learning target, allowing it to generalise to unseen intersection layouts. This should lower the traj_term below the reference baseline's 0.806 (ADE 40.2 px).
+
+### Results (Dev set, 5 k sample)
+
+| Metric                    | Value            |
+| ------------------------- | ---------------- |
+| **Composite score** | **0.7738** |
+| intent_term               | 0.833            |
+| traj_term                 | 0.715            |
+| BCE                       | 0.2072           |
+| ADE                       | 35.6 px          |
+
+*Beats reference baseline (0.8311) and Experiment #2 (0.8211). Trajectory term improved from 0.809 → 0.715; intent unchanged.*
+
+---
+
 ## Scoring Reference
 
 ```
