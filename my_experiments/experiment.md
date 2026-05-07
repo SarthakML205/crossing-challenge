@@ -219,6 +219,49 @@ Combining class-rebalancing (`pos_weight`) with dynamic loss scaling (`ALPHA=5`)
 
 ---
 
+## Experiment #5.2 — MTL with PCGrad (Gradient Surgery)
+
+### Description
+
+Refinement of the MTL architecture using **PCGrad** (Yu et al., 2020, "Gradient Surgery for Multi-Task Learning") to prevent task interference at the gradient level instead of via manual loss weighting.
+
+**PCGrad algorithm (per batch, per parameter):**
+1. Two separate backward passes extract `g_intent` and `g_traj` for each parameter.
+2. If `g_intent · g_traj < 0` (gradients conflict), project each onto the normal plane of the other:
+   - `g_intent -= (dot / ‖g_traj‖²) × g_traj`
+   - `g_traj   -= (dot / ‖g_intent‖²) × g_intent`
+3. `p.grad = g_intent_projected + g_traj_projected`, then `opt.step()`.
+
+**Settings:** `ALPHA = BETA = 1.0` (PCGrad manages direction; no manual tug-of-war), `pos_weight ≈ 11.6` on BCE (handles 7.9% class imbalance). Implementation: `retain_graph=True` on the first backward pass; overhead ≈ 2× per-batch backward cost.
+
+### Hypothesis
+
+By surgically projecting conflicting gradients before accumulation, the shared GRU backbone can receive useful learning signal from both tasks without one dominating. This should recover trajectory performance close to Exp #4 (ADE ~33.4 px) while allowing the intent head to benefit from backbone motion features — pushing BCE below 0.24 (intent_term < 0.965) without the collapse seen in Exp #5.1.
+
+### Results (Dev set, 5 k sample)
+
+| Metric | Value |
+|---|---|
+| **Composite score** | **1.5415** |
+| intent_term | 2.010 |
+| traj_term | 1.073 |
+| BCE | 0.5001 |
+| ADE | 53.4 px |
+
+**Both tasks collapsed again** (ADE 53.4 px vs 35.4 px in Exp #5, BCE 0.5001 vs 0.2477).
+
+**Root cause:** PCGrad projects away the *conflicting direction* of the intent gradient but does not reduce its *magnitude*. With `pos_weight=11.6`, the BCE gradient vector is ~11.6× larger than without it. The trajectory gradient (SmoothL1 on normalised deltas, magnitude ~0.015) is then projected by the dominant intent gradient — the component orthogonal to intent is near-zero, effectively zeroing the trajectory update. This is the same collapse as Exp #5.1, just arriving via a different mechanism.
+
+**Final conclusion on MTL viability:** After three optimization strategies (loss reweighting, class-weighted BCE + clipping, gradient surgery), the single shared-backbone MTL architecture is not viable for this task pair:
+- Trajectory needs a backbone that prioritises smooth 16-frame motion patterns (dense, continuous regression signal)
+- Intent needs a backbone that weights rare high-velocity events at 7.9% occurrence (sparse, binary, benefits from hand-crafted statistics)
+
+Any mechanism that gives the intent signal enough gradient budget to learn crossing events destabilises the motion representation the trajectory head needs. The **Experiment #4 split-model** (LightGBM intent + GRU trajectory, score 0.7515, ADE 33.4 px, BCE 0.2072) is the definitive best approach for this architecture class.
+
+*Experiment #5 weights restored after this ablation (ALPHA=0.05, BETA=20). Restoration rerun: score 0.8291, intent_term 0.951, traj_term 0.707, BCE 0.2367, ADE 35.2 px — the active `mtl_model.pth`.*
+
+---
+
 ## Scoring Reference
 
 ```

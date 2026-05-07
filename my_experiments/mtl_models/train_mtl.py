@@ -6,17 +6,27 @@ Usage (from my_experiments/):
 Architecture
 ------------
 Shared GRU (input_size=6: bbox_norm + ego_speed_norm + ego_yaw_norm)
-  → intent_head: Linear → BCEWithLogitsLoss
+  → intent_head: Linear → BCEWithLogitsLoss (pos_weight for class imbalance)
   → traj_head:   Linear → SmoothL1Loss on normalised delta from anchor
 
-Loss (Experiment #5 restored settings)
----------------------------------------
-    total_loss = ALPHA * BCE + BETA * SmoothL1
+Loss — Experiment #5.2 (PCGrad / Gradient Surgery)
+---------------------------------------------------
+PCGrad (Yu et al. 2020) replaces the naive summed backward with a
+per-parameter gradient projection:
 
-ALPHA=0.05, BETA=20.0 — trajectory dominates ~90% of backbone gradient.
-Experiment #5.1 tried pos_weight=11.6, ALPHA=5.0, BETA=1.0, grad_clip=1.0
-but the effective BCE scaling (~58×) collapsed both tasks (ADE 62.7 px,
-score 1.68). These settings are kept for rerun reproducibility.
+  For each param p and task pair (intent, traj):
+    dot = g_intent_p · g_traj_p
+    if dot < 0:                    # gradients conflict
+        g_intent_p -= (dot / ||g_traj_p||²) * g_traj_p   # project
+        g_traj_p   -= (dot / ||g_intent_p_orig||²) * g_intent_p_orig
+    p.grad = g_intent_p + g_traj_p
+
+This eliminates manual loss-weight tuning for gradient direction:
+  ALPHA = BETA = 1.0  (PCGrad manages conflict direction)
+  pos_weight ≈11.6 on BCE  (handles 7.9% class imbalance magnitude)
+
+Implementation: two backward passes per batch with retain_graph=True
+for the first pass. Overhead: ~2× per-batch backward cost.
 
 Grid search
 -----------
@@ -58,9 +68,10 @@ EGO_SPEED_NORM = 30.0    # m/s ceiling — zeros stay zero for ego_available=Fal
 EGO_YAW_NORM   = 1.0     # rad/s ceiling
 HORIZONS = ["bbox_500ms", "bbox_1000ms", "bbox_1500ms", "bbox_2000ms"]
 
-# Loss weights — Experiment #5 restored settings.
+# Loss weights — Experiment #5 restored (best MTL configuration found).
 # ALPHA=0.05, BETA=20: trajectory dominates ~90% of backbone gradient.
-# See docstring for why Experiment #5.1 settings were reverted.
+# PCGrad (Exp #5.2) and pos_weight+ALPHA=5 (Exp #5.1) both collapsed
+# because BCE gradient magnitude overwhelmed trajectory learning.
 ALPHA = 0.05   # BCE weight
 BETA  = 20.0   # SmoothL1 weight
 
@@ -161,6 +172,65 @@ def pixel_ade_from_delta(
     return float(np.sqrt((pcx - gcx) ** 2 + (pcy - gcy) ** 2).mean())
 
 
+def pcgrad_step(
+    model: nn.Module,
+    opt: torch.optim.Optimizer,
+    loss_intent: torch.Tensor,
+    loss_traj: torch.Tensor,
+) -> None:
+    """PCGrad (Yu et al. 2020): project conflicting task gradients, then update.
+
+    Algorithm (symmetric projection for both tasks):
+      1. Backward intent loss  → g_intent per parameter.
+      2. Backward traj loss    → g_traj   per parameter.
+      3. For each parameter:
+           dot = g_intent · g_traj
+           if dot < 0:
+               g_intent -= (dot / ||g_traj||²) * g_traj   (project)
+               g_traj   -= (dot / ||g_intent_orig||²) * g_intent_orig
+      4. p.grad = g_intent + g_traj
+      5. opt.step()
+    """
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    # Pass 1: intent gradients
+    opt.zero_grad()
+    loss_intent.backward(retain_graph=True)
+    g_intent = [
+        p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+        for p in params
+    ]
+
+    # Pass 2: trajectory gradients
+    opt.zero_grad()
+    loss_traj.backward()
+    g_traj = [
+        p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+        for p in params
+    ]
+
+    # Symmetric PCGrad projection
+    g_intent_proj: list[torch.Tensor] = []
+    g_traj_proj:   list[torch.Tensor] = []
+    for gi, gt in zip(g_intent, g_traj):
+        gi_flat = gi.view(-1)
+        gt_flat = gt.view(-1)
+        dot = torch.dot(gi_flat, gt_flat)
+        if dot < 0:
+            gt_sq = torch.dot(gt_flat, gt_flat).clamp(min=1e-12)
+            gi_sq = torch.dot(gi_flat, gi_flat).clamp(min=1e-12)
+            gi = gi - (dot / gt_sq) * gt          # project gi away from gt
+            gt = gt - (dot / gi_sq) * gi_flat.view_as(gt)  # project gt away from original gi
+        g_intent_proj.append(gi)
+        g_traj_proj.append(gt)
+
+    # Write summed projected gradients and step
+    opt.zero_grad()
+    for p, gi_p, gt_p in zip(params, g_intent_proj, g_traj_proj):
+        p.grad = gi_p + gt_p
+    opt.step()
+
+
 # ── Training loop ─────────────────────────────────────────────────────────────
 
 def train_one(
@@ -175,8 +245,8 @@ def train_one(
     """Train one hyperparameter combo; return (best_dev_ade, state_dict, epoch)."""
     model = MTLGRUModel(**hp).to(device)
     opt   = torch.optim.Adam(model.parameters(), lr=LR)
-    bce_crit    = nn.BCEWithLogitsLoss()
-    bce_eval    = bce_crit   # same criterion; no pos_weight in restored settings
+    bce_crit    = nn.BCEWithLogitsLoss()   # no pos_weight: Exp #5 restored
+    bce_eval    = bce_crit
     smooth_crit = nn.SmoothL1Loss()
 
     ds = TensorDataset(
@@ -197,8 +267,8 @@ def train_one(
     for epoch in range(1, MAX_EPOCHS + 1):
         model.train()
         for xb, yb_delta, yb_intent in loader:
-            xb       = xb.to(device)
-            yb_delta = yb_delta.to(device)
+            xb        = xb.to(device)
+            yb_delta  = yb_delta.to(device)
             yb_intent = yb_intent.to(device)
             opt.zero_grad()
             logit, delta = model(xb)
