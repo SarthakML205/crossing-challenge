@@ -185,6 +185,40 @@ A unified GRU backbone will learn shared motion representations that simultaneou
 
 ---
 
+## Experiment #5.1 — MTL Loss Balancing & Class Weighting
+
+### Description
+
+Refinement of Experiment #5 targeting the task-interference problem: intent BCE 0.2477 (intent_term 0.996) vs LightGBM's 0.2072 (0.833). Three simultaneous changes applied to `mtl_models/train_mtl.py`:
+
+1. **`pos_weight = N_neg / N_pos ≈ 11.6`** (computed from training data) — forces `BCEWithLogitsLoss` to penalise missed crossings 11.6× more than false positives.
+2. **`ALPHA=5.0, BETA=1.0`** — raised intent weight so that `weighted_BCE ≈ 5 × 11.6 × 0.27 ≈ 15.7` and `SmoothL1 ≈ 1.0 × 0.015 ≈ 0.015` at epoch 1 (ratio ~1000:1 in favour of intent).
+3. **`clip_grad_norm_(model.parameters(), 1.0)`** — gradient clipping after every backward pass.
+
+### Hypothesis
+
+Combining class-rebalancing (`pos_weight`) with dynamic loss scaling (`ALPHA=5`) and gradient clipping would force the shared backbone to extract crossing-predictive features while clipping prevents runaway BCE gradients from destabilising trajectory learning.
+
+### Results (Dev set, 5 k sample)
+
+| | Attempt (ALPHA=5, pos_weight=11.6) |
+|---|---|
+| **Composite score** | **1.6807** |
+| intent_term | 2.079 |
+| traj_term | 1.282 |
+| BCE | 0.5172 |
+| ADE | 63.9 px |
+
+**Both tasks collapsed** (ADE regressed from 35.4 → 63.9 px, BCE worsened 0.2477 → 0.5172).
+
+**Root cause:** The effective BCE gradient scale was `pos_weight × ALPHA = 11.6 × 5.0 = 58×` the SmoothL1 signal. Despite clipping, the intent signal dominated 99.97% of the gradient budget, preventing the backbone from learning any motion patterns. Early stopping triggered within 24–41 epochs across all combos with dev ADE stuck near the zero-velocity floor (~63 px).
+
+**Conclusion:** The MTL architecture with a single shared backbone is not viable for this task combination at this training set size. The tasks require fundamentally different gradient directions: trajectory needs smooth motion features over 16 frames; intent is a sparse binary signal at 7.9% imbalance that benefits from hand-crafted velocity statistics. Any loss weight that gives intent enough gradient to learn destroys trajectory, and vice versa. The Experiment #5 settings (ALPHA=0.05) are the Pareto-optimal MTL configuration; the split-model approach (LightGBM intent + GRU trajectory, Experiment #4) remains the best result.
+
+*Experiment #5 weights restored after this ablation (ALPHA=0.05, BETA=20).*
+
+---
+
 ## Scoring Reference
 
 ```

@@ -9,12 +9,14 @@ Shared GRU (input_size=6: bbox_norm + ego_speed_norm + ego_yaw_norm)
   → intent_head: Linear → BCEWithLogitsLoss
   → traj_head:   Linear → SmoothL1Loss on normalised delta from anchor
 
-Loss
-----
+Loss (Experiment #5 restored settings)
+---------------------------------------
     total_loss = ALPHA * BCE + BETA * SmoothL1
 
-ALPHA=1.0, BETA=20.0 — chosen so both terms are approximately equal magnitude
-at epoch 1 (intent BCE ≈ 0.3, traj SmoothL1 ≈ 0.015 on normalised deltas).
+ALPHA=0.05, BETA=20.0 — trajectory dominates ~90% of backbone gradient.
+Experiment #5.1 tried pos_weight=11.6, ALPHA=5.0, BETA=1.0, grad_clip=1.0
+but the effective BCE scaling (~58×) collapsed both tasks (ADE 62.7 px,
+score 1.68). These settings are kept for rerun reproducibility.
 
 Grid search
 -----------
@@ -56,13 +58,11 @@ EGO_SPEED_NORM = 30.0    # m/s ceiling — zeros stay zero for ego_available=Fal
 EGO_YAW_NORM   = 1.0     # rad/s ceiling
 HORIZONS = ["bbox_500ms", "bbox_1000ms", "bbox_1500ms", "bbox_2000ms"]
 
-# Loss weights: ALPHA*BCE vs BETA*SmoothL1.
-# At epoch 1: BCE ≈ 0.27, SmoothL1 ≈ 0.015.
-# ALPHA=0.05, BETA=20 → 0.014 vs 0.30 — trajectory dominates ~20:1.
-# This prevents the sparse intent signal (7.9% positive rate) from
-# corrupting the shared backbone's motion representation.
-ALPHA = 0.05  # BCE weight (kept small so intent doesn't dominate gradients)
-BETA  = 20.0  # SmoothL1 weight
+# Loss weights — Experiment #5 restored settings.
+# ALPHA=0.05, BETA=20: trajectory dominates ~90% of backbone gradient.
+# See docstring for why Experiment #5.1 settings were reverted.
+ALPHA = 0.05   # BCE weight
+BETA  = 20.0   # SmoothL1 weight
 
 BATCH_SIZE     = 256
 MAX_EPOCHS     = 80
@@ -100,12 +100,13 @@ def _stack_1d(series: pd.Series) -> np.ndarray:
 
 
 def load_split(split: str):
-    """Return (X, anchor, y_delta, y_intent) float32 arrays.
+    """Return (X, anchor, y_delta, y_intent, pos_weight) float32 arrays.
 
-    X        : (N, 16, 6)  — [bbox_norm(4), ego_speed_norm, ego_yaw_norm]
-    anchor   : (N,  1, 4)  — last observed bbox normalised
-    y_delta  : (N,  4, 4)  — future_bbox_norm - anchor  (displacement target)
-    y_intent : (N,)        — will_cross_2s as float32 (0.0 / 1.0)
+    X          : (N, 16, 6)  — [bbox_norm(4), ego_speed_norm, ego_yaw_norm]
+    anchor     : (N,  1, 4)  — last observed bbox normalised
+    y_delta    : (N,  4, 4)  — future_bbox_norm - anchor  (displacement target)
+    y_intent   : (N,)        — will_cross_2s as float32 (0.0 / 1.0)
+    pos_weight : float       — N_neg / N_pos (kept for reference; not used in training)
     """
     print(f"  Loading {split}.parquet ...", flush=True)
     df = pd.read_parquet(DATA / f"{split}.parquet")
@@ -129,13 +130,18 @@ def load_split(split: str):
 
     y_intent = df["will_cross_2s"].astype(np.float32).values.copy()  # (N,)
 
+    n_pos = y_intent.sum()
+    n_neg = len(y_intent) - n_pos
+    pos_weight = float(n_neg / max(n_pos, 1))
+
     pos_rate = y_intent.mean()
-    print(f"    {split}: {len(df):,} rows  crossing={pos_rate:.1%}", flush=True)
+    print(f"    {split}: {len(df):,} rows  crossing={pos_rate:.1%}  pos_weight={pos_weight:.1f}", flush=True)
     return (
         X.astype(np.float32),
         anchor.astype(np.float32),
         y_delta.astype(np.float32),
         y_intent,
+        pos_weight,
     )
 
 
@@ -164,11 +170,13 @@ def train_one(
     X_dev: np.ndarray, anchor_dev: np.ndarray,
     y_dev: np.ndarray, y_intent_dev: np.ndarray,
     device: torch.device,
+    pos_weight: float,
 ) -> tuple[float, dict, int]:
     """Train one hyperparameter combo; return (best_dev_ade, state_dict, epoch)."""
     model = MTLGRUModel(**hp).to(device)
     opt   = torch.optim.Adam(model.parameters(), lr=LR)
     bce_crit    = nn.BCEWithLogitsLoss()
+    bce_eval    = bce_crit   # same criterion; no pos_weight in restored settings
     smooth_crit = nn.SmoothL1Loss()
 
     ds = TensorDataset(
@@ -206,7 +214,7 @@ def train_one(
             dev_logit, dev_delta = model(X_dev_t)
 
         ade     = pixel_ade_from_delta(dev_delta.cpu().numpy(), anchor_dev, y_dev)
-        dev_bce = float(bce_crit(dev_logit, intent_dev_t).cpu().item())
+        dev_bce = float(bce_eval(dev_logit, intent_dev_t).cpu().item())
 
         if ade < best_ade - IMPROVE_THRESH:
             best_ade   = ade
@@ -236,8 +244,8 @@ def main() -> None:
     print(f"Device: {device}", flush=True)
 
     print("\nLoading data ...", flush=True)
-    X_tr, anchor_tr, y_tr, y_intent_tr   = load_split("train")
-    X_dev, anchor_dev, y_dev, y_intent_dev = load_split("dev")
+    X_tr, anchor_tr, y_tr, y_intent_tr, pos_weight   = load_split("train")
+    X_dev, anchor_dev, y_dev, y_intent_dev, _         = load_split("dev")
 
     n_combos = len(PARAM_GRID)
     results: list[tuple[float, dict, dict, int]] = []
@@ -250,6 +258,7 @@ def main() -> None:
             X_tr, anchor_tr, y_tr, y_intent_tr,
             X_dev, anchor_dev, y_dev, y_intent_dev,
             device,
+            pos_weight,
         )
         results.append((ade, hp, state, epochs))
         print(f"  dev_ADE={ade:.2f} px  stopped_at_epoch={epochs}", flush=True)
